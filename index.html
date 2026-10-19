@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JK BMS Monitor</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9; --dim:#8b949e; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 "Segoe UI",system-ui,-apple-system,sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; }
+  .dot { width:11px; height:11px; border-radius:50%; background:#f85149; flex:0 0 auto; }
+  .dot.on { background:#3fb950; }
+  .muted { color:var(--dim); }
+  main { padding:16px; display:grid; grid-template-columns:1fr 1fr; gap:16px; max-width:1100px; margin:0 auto; }
+  @media (max-width:720px) { main { grid-template-columns:1fr; } }
+  .pack { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .pack h2 { margin:0 0 8px; font-size:15px; }
+  .flags { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+  .flag { padding:2px 9px; border-radius:999px; font-size:12px; border:1px solid var(--border); color:var(--dim); }
+  .flag.on-true { color:#0d1117; background:#3fb950; border-color:#3fb950; font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .cell { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+  .cell .lbl { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+  .cell .val { font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .cell .unit { color:var(--dim); font-size:12px; }
+  .cells16 { display:grid; grid-template-columns:repeat(8,1fr); gap:5px; margin-top:12px; }
+  .cells16 .c { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:5px 2px; text-align:center; font-size:12px; font-variant-numeric:tabular-nums; }
+  .cells16 .c b { display:block; color:var(--dim); font-weight:400; font-size:10px; }
+  .switches { margin-top:12px; font-size:12px; color:var(--dim); }
+  .switches b { color:var(--fg); }
+  .overview { margin-top:10px; padding:8px 10px; background:var(--bg); border:1px solid var(--border); border-radius:8px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; }
+  /* password prompt */
+  #gate { position:fixed; inset:0; background:rgba(0,0,0,.72); display:flex; align-items:center; justify-content:center; z-index:10; }
+  #gate .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:22px 24px; width:min(360px,90vw); }
+  #gate h2 { margin:0 0 4px; font-size:16px; }
+  #gate p { color:var(--dim); font-size:12.5px; margin:0 0 14px; }
+  #gate input { width:100%; padding:10px 12px; background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:8px; font-size:14px; }
+  #gate button { width:100%; margin-top:12px; padding:10px; background:#238636; color:#fff; border:0; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; }
+  #gate .err { color:#f85149; font-size:12.5px; min-height:1.2em; margin-top:8px; }
+  #gate .note { margin-top:12px; font-size:11.5px; color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>JK BMS Monitor</h1>
+  <span class="muted" id="connstate">connecting…</span>
+  <span class="muted" style="margin-left:auto" id="stats"></span>
+</header>
+<main id="main"></main>
+
+<div id="gate" style="display:none">
+  <div class="card">
+    <h2>Unlock dashboard</h2>
+    <p>Enter your MQTT password once. It is saved only in this browser, on this device — never sent anywhere but the broker.</p>
+    <input type="password" id="pw" placeholder="MQTT password" autocomplete="off">
+    <button id="go">Connect</button>
+    <div class="err" id="gaterr"></div>
+    <div class="note">Stored locally (localStorage). To forget it, clear this site's data.</div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<script>
+const HOST = "d0fa1a16.ala.eu-central-1.emqxsl.com";
+const USER = "etruszk_bms";
+const STORE_KEY = "bms_pass";
+const PACKS = { felso:{title:"FELSŐ (upper)"}, also:{title:"ALSÓ (lower)"} };
+const METRICS = [
+  ["state_of_charge","SOC","%"],
+  ["total_voltage","Total V","V"],
+  ["current","Current","A"],
+  ["power","Power","W"],
+  ["charging_power","Charge","W"],
+  ["discharging_power","Discharge","W"],
+  ["average_cell_voltage","Avg cell","V"],
+  ["min_cell_voltage","Min cell","V"],
+  ["max_cell_voltage","Max cell","V"],
+  ["delta_cell_voltage","Cell Δ","V"],
+  ["temperature_sensor_1","Temp 1","°C"],
+  ["temperature_sensor_2","Temp 2","°C"],
+  ["mosfet_temperature","MOSFET","°C"],
+  ["balancing_current","Balance","A"],
+  ["full_charge_capacity","Capacity","Ah"],
+];
+const FLAGS = ["charging","discharging","balancing","heating"];
+const SWITCHES = ["charging","discharging","balancer","enable_bluetooth_connection"];
+
+const main = document.getElementById("main");
+const els = {};
+const flagsEl = {};
+
+function el(tag, cls){ const e=document.createElement(tag); if(cls)e.className=cls; return e; }
+
+for (const [pname, p] of Object.entries(PACKS)) {
+  const pack = el("div","pack");
+  const h = el("h2"); h.textContent = p.title; pack.appendChild(h);
+
+  const flags = el("div","flags"); pack.appendChild(flags);
+  for (const f of FLAGS) {
+    const id = "k_binary_sensor_"+pname+"_"+f;
+    const fe = el("span","flag"); fe.id = id; fe.textContent = f.toUpperCase();
+    flags.appendChild(fe); flagsEl[id] = fe;
+  }
+
+  const grid = el("div","grid"); pack.appendChild(grid);
+  for (const [name,label,unit] of METRICS) {
+    const id = "k_sensor_"+pname+"_"+name;
+    const c = el("div","cell");
+    const lb = el("div","lbl"); lb.textContent = label;
+    const va = el("div","val"); va.id = id; va.textContent = "—";
+    const un = el("div","unit"); un.innerHTML = unit || "&nbsp;";
+    c.appendChild(lb); c.appendChild(va); c.appendChild(un);
+    grid.appendChild(c); els[id] = va;
+  }
+
+  const cells = el("div","cells16"); pack.appendChild(cells);
+  for (let i=1;i<=16;i++) {
+    const id = "k_sensor_"+pname+"_cell_voltage_"+i;
+    const c = el("div","c");
+    const b = el("b"); b.textContent = "C"+i;
+    const sp = el("span"); sp.id = id; sp.textContent = "—";
+    c.appendChild(b); c.appendChild(sp);
+    cells.appendChild(c); els[id] = sp;
+  }
+
+  const sw = el("div","switches"); pack.appendChild(sw);
+  sw.appendChild(document.createTextNode("switches:  "));
+  for (const s of SWITCHES) {
+    const id = "k_switch_"+pname+"_"+s;
+    const w = el("span");
+    const b = el("b"); b.textContent = s.replace(/_/g," ");
+    const v = el("span"); v.id = id; v.textContent = "?";
+    w.appendChild(b); w.appendChild(document.createTextNode("="));
+    w.appendChild(v); w.appendChild(document.createTextNode("   "));
+    sw.appendChild(w); els[id] = v;
+  }
+
+  const ov = el("div","overview"); ov.id = "k_sensor_"+pname+"_overview"; ov.textContent = "overview: —";
+  pack.appendChild(ov); els[ov.id] = ov;
+
+  main.appendChild(pack);
+}
+
+const dot = document.getElementById("dot");
+const connstate = document.getElementById("connstate");
+const stats = document.getElementById("stats");
+let msgCount = 0, lastAt = 0, client = null;
+
+function kindFromTopic(topic) {
+  if (topic === "jk-bms-monitor/status") return ["k_status",""];
+  const rest = topic.replace("jk-bms-monitor/","");
+  const idx = rest.lastIndexOf("/state");
+  if (idx !== -1) {
+    const mid = rest.slice(0, idx);
+    const parts = mid.split("/");
+    if (parts.length === 2) return ["k_"+parts[0]+"_"+parts[1], parts[0]];
+  }
+  return [null, null];
+}
+
+function start(pass) {
+  if (client) { try { client.end(true); } catch (e) {} }
+  client = mqtt.connect("wss://"+HOST+":8084/mqtt", {
+    username: USER,
+    password: pass,
+    clientId: "bms-web-" + Math.random().toString(16).slice(2,10),
+    clean: true, reconnectPeriod: 4000, connectTimeout: 12000,
+  });
+  client.on("connect", () => {
+    dot.classList.add("on");
+    connstate.textContent = "connected · " + HOST;
+    client.subscribe("jk-bms-monitor/#", {qos:0});
+  });
+  client.on("reconnect", () => { dot.classList.remove("on"); connstate.textContent = "reconnecting…"; });
+  client.on("error", (e) => {
+    connstate.textContent = "error: " + (e && e.message ? e.message : e);
+    // bad password shows up as auth failure; surface it in the gate if visible
+    const errEl = document.getElementById("gaterr");
+    if (errEl) errEl.textContent = "Connection failed (check password).";
+    if (gateEl.style.display !== "none") { localStorage.removeItem(STORE_KEY); gateEl.style.display = "flex"; }
+  });
+  client.on("close", () => { dot.classList.remove("on"); connstate.textContent = "disconnected"; });
+
+  client.on("message", (topic, payload) => {
+    msgCount++; lastAt = Date.now();
+    const [id, prefix] = kindFromTopic(topic);
+    const val = payload.toString();
+    if (!id) return;
+    if (id === "k_status") { if (val === "online") dot.classList.add("on"); else dot.classList.remove("on"); }
+    const target = els[id];
+    if (target) target.textContent = val;
+    if (prefix === "binary_sensor" && flagsEl[id]) flagsEl[id].classList.toggle("on-true", val === "ON");
+  });
+}
+
+setInterval(() => {
+  stats.textContent = msgCount + " msgs · " + (lastAt ? Math.round((Date.now()-lastAt)/1000)+"s ago" : "—");
+}, 1000);
+
+const gateEl = document.getElementById("gate");
+const pw = document.getElementById("pw");
+const gateErr = document.getElementById("gaterr");
+const saved = localStorage.getItem(STORE_KEY);
+if (saved) { start(saved); }
+else { gateEl.style.display = "flex"; pw.focus(); }
+
+function unlock() {
+  const v = pw.value.trim();
+  if (!v) { gateErr.textContent = "Enter a password."; return; }
+  gateErr.textContent = "";
+  localStorage.setItem(STORE_KEY, v);
+  gateEl.style.display = "none";
+  start(v);
+}
+document.getElementById("go").addEventListener("click", unlock);
+pw.addEventListener("keydown", (e) => { if (e.key === "Enter") unlock(); });
+</script>
+</body>
+</html>
